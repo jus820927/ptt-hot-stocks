@@ -1,0 +1,58 @@
+name: PTT 個股熱度統計
+
+# 觸發時機：
+#   1. schedule：每小時整點執行一次（cron 時間為 UTC，換算台灣時間一樣是整點，
+#      因為 UTC 與台灣時間的分鐘數相同，只差時區的小時位移）
+#   2. workflow_dispatch：讓你可以在 GitHub 網頁上手動按「Run workflow」立即測試，
+#      不用乾等下一個整點
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch: {}
+
+# 避免上一次還沒跑完，下一次又觸發，導致同時有兩個部署互相搶著發布
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pages: write        # 允許發布到 GitHub Pages
+  id-token: write     # GitHub Pages 部署動作需要的身分驗證
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 取得程式碼
+        uses: actions/checkout@v4
+
+      - name: 設定 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安裝套件
+        run: pip install -r requirements.txt
+
+      - name: 執行爬蟲
+        run: python scraper.py
+
+      - name: 準備 GitHub Pages 環境
+        uses: actions/configure-pages@v5
+
+      - name: 打包輸出結果
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+  deploy:
+    needs: scrape
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: 發布到 GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
