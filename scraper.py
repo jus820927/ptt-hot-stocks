@@ -128,4 +128,262 @@ def extract_codes(text: str, year_blacklist: set[str]) -> set[str]:
 
 # ======================================================================
 # 網路請求（含重試、節流、逾時）
-# ==================================================================
+# ======================================================================
+_session = requests.Session()
+_session.headers.update(HEADERS)
+_session.cookies.update(COOKIES)
+
+
+def fetch(url: str) -> Optional[str]:
+    """GET 一個網址，失敗時重試，全部失敗回傳 None 並印出警告（不拋例外中止整體流程）。"""
+    for attempt in range(1, MAX_RETRY + 1):
+        try:
+            resp = _session.get(url, timeout=REQUEST_TIMEOUT)
+            if resp.status_code == 200:
+                time.sleep(random.uniform(*REQUEST_DELAY_RANGE))
+                return resp.text
+            print(f"  [警告] {url} 回傳 HTTP {resp.status_code}（第 {attempt}/{MAX_RETRY} 次）",
+                  file=sys.stderr)
+        except requests.RequestException as exc:
+            print(f"  [警告] {url} 請求失敗：{exc}（第 {attempt}/{MAX_RETRY} 次）", file=sys.stderr)
+        time.sleep(1.5 * attempt)
+    return None
+
+
+# ======================================================================
+# 看板列表頁：蒐集候選文章連結
+# ======================================================================
+def parse_index_page(html: str) -> tuple[list[dict], Optional[str]]:
+    """
+    解析單一看板列表頁。
+
+    Returns
+    -------
+    (entries, prev_url)
+        entries：[{"url": 文章網址, "date": "M/DD" 字串}, ...]
+        已被刪除的文章沒有連結（div.title 內只有文字沒有 <a>），直接跳過，
+        這是資料本身就不存在，不是抓取失敗，不視為錯誤。
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    entries = []
+    for div in soup.select("div.r-ent"):
+        a = div.select_one("div.title a")
+        if not a or not a.get("href"):
+            continue
+        date_div = div.select_one("div.meta div.date")
+        date_text = date_div.get_text(strip=True) if date_div else ""
+        entries.append({"url": BASE + a["href"], "date": date_text})
+
+    prev_url = None
+    for a in soup.select("div.btn-group-paging a"):
+        if "上頁" in a.get_text():
+            href = a.get("href")
+            prev_url = BASE + href if href else None
+    return entries, prev_url
+
+
+def collect_recent_article_urls(now: datetime) -> list[str]:
+    """
+    從看板最新頁往回翻頁，蒐集「日期落在今天或昨天」的候選文章連結。
+
+    精確的 24 小時邊界判斷交給逐篇文章的完整時間戳記處理（見 parse_article）；
+    這裡的日期比對只用來決定「要不要繼續往回翻頁」，屬於效率考量，
+    寧可稍微多抓一點候選也不要漏抓。
+    """
+    today_str = f"{now.month}/{now.day:02d}"
+    yesterday = now - timedelta(days=1)
+    yesterday_str = f"{yesterday.month}/{yesterday.day:02d}"
+    valid_dates = {today_str, yesterday_str}
+
+    urls: list[str] = []
+    url = BOARD_URL
+    for page_i in range(MAX_PAGES):
+        html = fetch(url)
+        if html is None:
+            print(f"[錯誤] 無法讀取看板列表頁：{url}", file=sys.stderr)
+            break
+
+        entries, prev_url = parse_index_page(html)
+        urls.extend(e["url"] for e in entries)
+        in_window = sum(1 for e in entries if e["date"] in valid_dates)
+        print(f"  第 {page_i + 1} 頁：{len(entries)} 篇候選，日期落在區間內 {in_window} 篇",
+              file=sys.stderr)
+
+        # 第一頁（index.html）可能混有置底公告（日期可能很舊），
+        # 因此只有第二頁以後才用「本頁完全沒有落在區間內的文章」當作停止條件。
+        if page_i > 0 and in_window == 0:
+            break
+        if prev_url is None:
+            break
+        url = prev_url
+
+    return urls
+
+
+# ======================================================================
+# 文章頁：解析內文、時間、推噓文
+# ======================================================================
+def parse_article(url: str, cutoff: datetime) -> Optional[dict]:
+    """
+    解析單篇文章。
+
+    Returns
+    -------
+    None            讀取失敗或格式無法解析（已印出警告）
+    {"too_old": True}   文章時間早於 cutoff，呼叫端應略過但不視為錯誤
+    {...}           正常結果
+    """
+    html = fetch(url)
+    if html is None:
+        return None
+
+    soup = BeautifulSoup(html, "html.parser")
+    main = soup.select_one("#main-content")
+    if main is None:
+        print(f"  [警告] 找不到內文區塊（版面可能已變更），略過：{url}", file=sys.stderr)
+        return None
+
+    # --- 解析 meta 欄位（作者／看板／標題／時間）---
+    meta: dict[str, str] = {}
+    for line in main.select("div.article-metaline, div.article-metaline-right"):
+        tag = line.select_one("span.article-meta-tag")
+        val = line.select_one("span.article-meta-value")
+        if tag and val:
+            meta[tag.get_text(strip=True)] = val.get_text(strip=True)
+
+    time_str = meta.get("時間", "").strip()
+    try:
+        dt_naive = datetime.strptime(time_str, "%a %b %d %H:%M:%S %Y")
+    except ValueError:
+        print(f"  [警告] 時間格式無法解析（{time_str!r}），略過：{url}", file=sys.stderr)
+        return None
+    published_at = dt_naive.replace(tzinfo=TZ)
+
+    if published_at < cutoff:
+        return {"too_old": True}
+
+    title = meta.get("標題", "")
+
+    # --- 推噓文計數（必須在移除 push 區塊之前數）---
+    push_count = 0
+    boo_count = 0
+    for push_div in main.select("div.push"):
+        tag_span = push_div.select_one("span.push-tag")
+        tag_text = tag_span.get_text(strip=True) if tag_span else ""
+        if tag_text.startswith("推"):
+            push_count += 1
+        elif tag_text.startswith("噓"):
+            boo_count += 1
+        # 「→」為註解／箭頭，不計入推噓分數
+
+    # --- 取出正文（移除 meta 區塊與推文區塊後剩下的文字）---
+    for tag in main.select("div.article-metaline, div.article-metaline-right, div.push"):
+        tag.decompose()
+    body_text = main.get_text("\n", strip=True)
+
+    return {
+        "url": url,
+        "title": title,
+        "published_at": published_at.isoformat(),
+        "push_count": push_count,
+        "boo_count": boo_count,
+        "text_for_codes": f"{title}\n{body_text}",
+    }
+
+
+# ======================================================================
+# 主流程
+# ======================================================================
+def main() -> int:
+    now = datetime.now(TZ)
+    cutoff = now - timedelta(hours=WINDOW_HOURS)
+    year_blacklist = build_year_blacklist(now)
+
+    print(f"執行時間：{now.isoformat()}", file=sys.stderr)
+    print(f"統計區間：{cutoff.isoformat()} ~ {now.isoformat()}", file=sys.stderr)
+
+    print("步驟 1/2：蒐集候選文章連結…", file=sys.stderr)
+    urls = collect_recent_article_urls(now)
+    urls = list(dict.fromkeys(urls))  # 去重，保留原順序
+    print(f"候選文章共 {len(urls)} 篇（含可能已超出區間或已被刪除者）", file=sys.stderr)
+
+    if not urls:
+        print("[錯誤] 完全抓不到候選文章連結，可能是 PTT 網站結構已變更或連線失敗。"
+              "不產出任何檔案，維持 Pages 上次成功的結果。", file=sys.stderr)
+        return 1
+
+    print("步驟 2/2：逐篇讀取內文與推噓文…", file=sys.stderr)
+    stats: dict[str, dict] = {}
+    fetched = 0
+    skipped_old = 0
+    skipped_error = 0
+
+    for i, url in enumerate(urls, start=1):
+        if i % 20 == 0:
+            print(f"  進度 {i}/{len(urls)}…", file=sys.stderr)
+
+        result = parse_article(url, cutoff)
+        if result is None:
+            skipped_error += 1
+            continue
+        if result.get("too_old"):
+            skipped_old += 1
+            continue
+
+        fetched += 1
+        codes = extract_codes(result["text_for_codes"], year_blacklist)
+        for code in codes:
+            s = stats.setdefault(code, {"article_count": 0, "push_count": 0, "boo_count": 0})
+            s["article_count"] += 1
+            s["push_count"] += result["push_count"]
+            s["boo_count"] += result["boo_count"]
+
+    print(
+        f"實際納入統計 {fetched} 篇｜超出 24 小時區間 {skipped_old} 篇｜讀取失敗 {skipped_error} 篇",
+        file=sys.stderr,
+    )
+
+    if fetched == 0:
+        print("[錯誤] 24 小時內沒有任何文章可統計，不覆蓋舊的 JSON 檔"
+              "（避免用空結果蓋掉正常資料）。", file=sys.stderr)
+        return 1
+
+    total = fetched + skipped_error
+    if total and skipped_error / total > 0.3:
+        print(f"[警告] 讀取失敗比例偏高（{skipped_error}/{total}），"
+              f"本次結果的覆蓋率可能不足，但仍會產出結果。", file=sys.stderr)
+
+    # --- 排序與輸出 ---
+    def score_of(item: tuple[str, dict]) -> int:
+        s = item[1]
+        return s["article_count"] * 3 + (s["push_count"] - s["boo_count"])
+
+    ranked = sorted(stats.items(), key=score_of, reverse=True)[:TOP_N]
+
+    output = {
+        "updated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "window_hours": WINDOW_HOURS,
+        "articles_scanned": fetched,
+        "articles_skipped_error": skipped_error,
+        "stocks": [
+            {
+                "rank": i + 1,
+                "stock_id": code,
+                "articles": s["article_count"],
+                "push_count": s["push_count"],
+                "boo_count": s["boo_count"],
+                "net_pushes": s["push_count"] - s["boo_count"],
+                "score": s["article_count"] * 3 + (s["push_count"] - s["boo_count"]),
+            }
+            for i, (code, s) in enumerate(ranked)
+        ],
+    }
+
+    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    OUTPUT_PATH.write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"已輸出：{OUTPUT_PATH}（共 {len(output['stocks'])} 檔股票）", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
